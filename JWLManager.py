@@ -33,9 +33,14 @@ BETA = False
 from res.ui_main_window import Ui_MainWindow
 from res.ui_extras import AboutBox, HelpBox, DataViewer, DropList, MergeDialog, TagDialog, ThemeManager, ViewerItem
 
-from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer,QTranslator
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer, QTranslator
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,QLabel, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSpacerItem, QTextEdit, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
+    QProgressDialog, QPushButton, QSizePolicy, QSpacerItem, QTextEdit,
+    QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget
+)
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -58,7 +63,7 @@ import polars as pl
 from jwlcore import merge_databases, get_core_version, get_last_result, lib, CALLBACKTYPE
 
 
-CORE_VERSION= get_core_version()
+CORE_VERSION = get_core_version()
 PROJECT_PATH = Path(__file__).resolve().parent
 TMP_PATH = mkdtemp(prefix='JWLManager_')
 DB_NAME = 'userData.db'
@@ -66,6 +71,62 @@ CALLBACKTYPE = ctypes.CFUNCTYPE(None, ctypes.c_int)
 
 
 class Window(QMainWindow, Ui_MainWindow):
+
+    def fix_document_id_errors(self):
+        if not hasattr(self, "current_file") or not self.current_file:
+            QMessageBox.warning(self, "No File Open", "Please open a .jwlibrary file first.")
+            return
+
+        def _detect_document_table(cursor):
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            # Check for common table names
+            for table_name in tables:
+                if 'document' in table_name.lower() or 'publication' in table_name.lower():
+                    return table_name
+            
+            # If no matching table found, raise error with available tables
+            available_tables = ", ".join(tables)
+            raise Exception(f"Could not find a Document/Publication table. Available tables: {available_tables}")
+
+        try:
+            con = sqlite3.connect(f'{TMP_PATH}/{DB_NAME}')
+            con.executescript("PRAGMA temp_store = 2; PRAGMA journal_mode = 'OFF'; BEGIN;")
+            
+            cursor = con.cursor()
+            doc_table = _detect_document_table(cursor)
+            
+            # Count invalid DocumentId entries
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM Location
+                WHERE DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
+            """)
+            invalid_count = cursor.fetchone()[0]
+            
+            # Fix invalid DocumentId entries
+            if invalid_count > 0:
+                cursor.execute(f"""
+                    UPDATE Location
+                    SET DocumentId = NULL
+                    WHERE DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
+                """)
+            
+            con.commit()
+            con.close()
+            
+            QMessageBox.information(
+                self,
+                "Fix Completed",
+                f"Fixed {invalid_count} invalid DocumentId entries."
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred:\n{str(e)}"
+            )
 
     def __init__(self, archive=''):
         super().__init__()
@@ -94,6 +155,16 @@ class Window(QMainWindow, Ui_MainWindow):
             self.actionSelect_All.triggered.connect(self.select_all)
             self.actionUnselect_All.triggered.connect(self.unselect_all)
             self.actionTheme.triggered.connect(self.toggle_theme)
+
+            # New action for fixing DocumentId errors
+            self.actionFixDocumentIdErrors = QAction("Fix DocumentId Errors", self)
+            self.actionFixDocumentIdErrors.triggered.connect(self.fix_document_id_errors)
+            if hasattr(self, 'menuTools'):
+                self.menuTools.addAction(self.actionFixDocumentIdErrors)
+            else:
+                self.menuTools = self.menuBar().addMenu("Tools")
+                self.menuTools.addAction(self.actionFixDocumentIdErrors)
+
             self.menuTitle_View.triggered.connect(self.change_title)
             self.menuLanguage.triggered.connect(self.change_language)
             self.combo_grouping.currentTextChanged.connect(lambda: self.regroup(False))
@@ -113,7 +184,7 @@ class Window(QMainWindow, Ui_MainWindow):
             self.int_total = 0
             self.modified = False
             self.loaded = False
-            self.title_format = settings.value('JWLManager/title','short')
+            self.title_format = settings.value('JWLManager/title', 'short')
             options = { 'code': 0, 'short': 1, 'full': 2 }
             self.titleChoices.actions()[options[self.title_format]].setChecked(True)
             self.save_filename = ''
@@ -148,7 +219,10 @@ class Window(QMainWindow, Ui_MainWindow):
         self.statusBar.addPermanentWidget(self.status_label, 0)
         self.statusBar.setStyleSheet('font-weight: bold;')
         self.treeWidget.setSortingEnabled(True)
-        self.treeWidget.sortByColumn(int(settings.value('JWLManager/sort', 1)), settings.value('JWLManager/direction', Qt.DescendingOrder))
+        self.treeWidget.sortByColumn(
+            int(settings.value('JWLManager/sort', 1)),
+            settings.value('JWLManager/direction', Qt.DescendingOrder)
+        )
         self.treeWidget.setColumnWidth(0, int(settings.value('JWLManager/column1', 500)))
         self.treeWidget.setColumnWidth(1, int(settings.value('JWLManager/column2', 30)))
         self.treeWidget.setExpandsOnDoubleClick(False)
@@ -170,27 +244,12 @@ class Window(QMainWindow, Ui_MainWindow):
             self.current_archive = ''
             self.new_file()
         if BETA:
-            QMessageBox.warning(None, APP, _('This is a pre-release.\nThank you for testing.\nPlease be careful.'), QMessageBox.Ok)
-
-
-    def check_file(self, file):
-        self.timer.stop()
-        if (self.current_archive == '') and (self.modified == False):
-            self.load_file(file)
-        else:
-            self.raise_()
-            self.activateWindow()
-            self.merge_window.setWindowTitle(_('Open or Merge'))
-            self.merge_window.archive.setText(Path(file).name)
-            self.merge_window.label.setText(_('Open archive or merge with current?'))
-            self.merge_window.open_button.setText(_('Open'))
-            self.merge_window.merge_button.setText(_('Merge'))
-            self.merge_window.exec()
-            if self.merge_window.choice == 'open':
-                self.load_file(file)
-            else:
-                self.merge_items(file)
-        self.timer.start(1000)
+            QMessageBox.warning(
+                None,
+                APP,
+                _('This is a pre-release.\nThank you for testing.\nPlease be careful.'),
+                QMessageBox.Ok
+            )
 
     def check_lockfile(self):
         if os.path.exists(LOCK_FILE) and os.path.getsize(LOCK_FILE) > 0:
@@ -964,29 +1023,45 @@ class Window(QMainWindow, Ui_MainWindow):
         if self.modified:
             self.check_save()
         if not archive:
-            fname = QFileDialog.getOpenFileName(self, _('Open archive'), str(self.working_dir),_('JW Library archives')+' (*.jwlibrary)')
+            fname = QFileDialog.getOpenFileName(
+                self,
+                _('Open archive'),
+                str(self.working_dir),
+                _('JW Library archives') + ' (*.jwlibrary)'
+            )
             if not fname[0]:
                 return False
             archive = fname[0]
+
         self.working_dir = Path(archive).parent
+
         if not self.check_validity(archive):
             return False
+
         self.current_archive = Path(archive)
         self.status_label.setText(f'{Path(archive).stem}  ')
         self.actionSave.setEnabled(False)
         self.status_label.setStyleSheet('font: normal;')
+
         try:
             for f in glob(f'{TMP_PATH}/*', recursive=True):
                 os.remove(f)
         except:
             pass
+
         try:
-            with ZipFile(archive,'r') as zipped:
+            with ZipFile(archive, 'r') as zipped:
                 zipped.extractall(TMP_PATH)
+
+            # 🔥 THIS IS THE FIX — set the path to the extracted database
+            self.current_file = os.path.join(TMP_PATH, DB_NAME)
+
             with open(f'{TMP_PATH}/manifest.json', 'r') as json_file:
                 self.manifest = json.load(json_file)
+
             self.file_loaded()
             return True
+
         except:
             return None
 
@@ -1001,7 +1076,6 @@ class Window(QMainWindow, Ui_MainWindow):
         except:
             pass
         self.switchboard(self.combo_category.currentText(), True)
-
 
     def save_file(self):
         if not self.save_filename:

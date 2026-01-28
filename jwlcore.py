@@ -81,3 +81,41 @@ def get_last_result() -> str | None:
 def get_core_version() -> str | None:
     p = lib.getCoreVersion()
     return p.decode("utf-8") if p else None
+
+
+# ---------------------------------------------------------------------------
+# NEW FUNCTION: Fix invalid DocumentId references inside the JW Library DB
+# ---------------------------------------------------------------------------
+
+def fix_document_id_errors(db_path: str) -> int:
+    """
+    Scans the Location table for invalid DocumentId values (those not present
+    in the Document table) and sets them to NULL.
+
+    Returns:
+        int: Number of invalid entries that were corrected.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Count invalid DocumentId references
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM Location
+        WHERE DocumentId NOT IN (SELECT DocumentId FROM Document)
+    """)
+    invalid_count = cursor.fetchone()[0]
+
+    # Fix them by setting DocumentId to NULL
+    cursor.execute("""
+        UPDATE Location
+        SET DocumentId = NULL
+        WHERE DocumentId NOT IN (SELECT DocumentId FROM Document)
+    """)
+
+    conn.commit()
+    conn.close()
+
+    return invalid_count
