@@ -81,14 +81,32 @@ class Window(QMainWindow, Ui_MainWindow):
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             tables = [row[0] for row in cursor.fetchall()]
             
-            # Check for common table names
-            for table_name in tables:
-                if 'document' in table_name.lower() or 'publication' in table_name.lower():
-                    return table_name
+            # Debug: log all tables
+            print(f"DEBUG: Available tables: {tables}")
             
-            # If no matching table found, raise error with available tables
-            available_tables = ", ".join(tables)
-            raise Exception(f"Could not find a Document/Publication table. Available tables: {available_tables}")
+            # Check for common table names (case-insensitive)
+            table_map = {t.lower(): t for t in tables}
+            
+            # Try to find document-related tables
+            for key in ['document', 'publication', 'publicationdocument']:
+                if key in table_map:
+                    result = table_map[key]
+                    print(f"DEBUG: Found matching table: {result}")
+                    return result
+            
+            # If still not found, try to find by checking which table has DocumentId column
+            for table_name in tables:
+                try:
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    columns = [col[1] for col in cursor.fetchall()]
+                    if 'DocumentId' in columns:
+                        print(f"DEBUG: Found table with DocumentId column: {table_name}")
+                        return table_name
+                except:
+                    pass
+            
+            # If no matching table found, return None to indicate fallback action
+            return None
 
         try:
             con = sqlite3.connect(f'{TMP_PATH}/{DB_NAME}')
@@ -96,22 +114,50 @@ class Window(QMainWindow, Ui_MainWindow):
             
             cursor = con.cursor()
             doc_table = _detect_document_table(cursor)
-            
-            # Count invalid DocumentId entries
-            cursor.execute(f"""
-                SELECT COUNT(*)
-                FROM Location
-                WHERE DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
-            """)
-            invalid_count = cursor.fetchone()[0]
-            
-            # Fix invalid DocumentId entries
-            if invalid_count > 0:
+
+            if doc_table:
+                print(f"DEBUG: Using table '{doc_table}' for document ID validation")
+
+                # Count invalid DocumentId entries
                 cursor.execute(f"""
-                    UPDATE Location
-                    SET DocumentId = NULL
-                    WHERE DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
+                    SELECT COUNT(*)
+                    FROM Location
+                    WHERE DocumentId IS NOT NULL 
+                    AND DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
                 """)
+                invalid_count = cursor.fetchone()[0]
+
+                print(f"DEBUG: Found {invalid_count} invalid DocumentId entries")
+
+                # Fix invalid DocumentId entries
+                if invalid_count > 0:
+                    cursor.execute(f"""
+                        UPDATE Location
+                        SET DocumentId = NULL
+                        WHERE DocumentId IS NOT NULL
+                        AND DocumentId NOT IN (SELECT DocumentId FROM {doc_table})
+                    """)
+            else:
+                # No document table found. Offer to clear all DocumentId values.
+                cursor.execute("SELECT COUNT(*) FROM Location WHERE DocumentId IS NOT NULL")
+                non_null_count = cursor.fetchone()[0]
+                if non_null_count == 0:
+                    invalid_count = 0
+                else:
+                    reply = QMessageBox.warning(
+                        self,
+                        _('No document table'),
+                        _('No document/publication table was found in this archive.\n') +
+                        _('All non-empty DocumentId values will be cleared.\nProceed?'),
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        cursor.execute('UPDATE Location SET DocumentId = NULL WHERE DocumentId IS NOT NULL')
+                        invalid_count = non_null_count
+                    else:
+                        # User cancelled; nothing changed
+                        invalid_count = 0
             
             con.commit()
             con.close()
@@ -164,6 +210,11 @@ class Window(QMainWindow, Ui_MainWindow):
             else:
                 self.menuTools = self.menuBar().addMenu("Tools")
                 self.menuTools.addAction(self.actionFixDocumentIdErrors)
+
+            # New action for cleaning duplicate notes
+            self.actionCleanDuplicates = QAction("Clean Duplicate Notes", self)
+            self.actionCleanDuplicates.triggered.connect(self.clean_duplicate_notes)
+            self.menuTools.addAction(self.actionCleanDuplicates)
 
             self.menuTitle_View.triggered.connect(self.change_title)
             self.menuLanguage.triggered.connect(self.change_language)
@@ -3730,6 +3781,177 @@ class Window(QMainWindow, Ui_MainWindow):
         self.regroup(True, message)
         self.archive_modified()
 
+    def clean_duplicate_notes(self):
+        def find_duplicates(cursor, *args, **kwargs):
+            """Return a dict mapping duplicate-key -> list of note rows.
+            Key is exact (title, content) equality — no normalization, location ignored."""
+
+            sql = """
+                SELECT NoteId, Title, Content, LocationId
+                FROM Note
+                WHERE (Title IS NOT NULL AND Title != '')
+                   OR (Content IS NOT NULL AND Content != '')
+                ORDER BY Title, Content, LocationId
+            """
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            groups = {}
+            for note_id, title, content, location_id in rows:
+                key = (title or '', content or '')
+                groups.setdefault(key, []).append((note_id, title or '', content or '', location_id))
+            # keep only groups that have duplicates (len>1)
+            dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
+            return dup_groups
+
+        def present_duplicates_dialog(compute_func):
+            """Show dialog with options, preview and export. compute_func(opts) -> dup_groups"""
+            opts = {
+                'ignore_whitespace': False,
+                'case_insensitive': False,
+                'ignore_punctuation': False
+            }
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(_('Duplicate notes found'))
+            dlg.resize(800, 600)
+
+            header_label = QLabel(dlg)
+
+            # Options (use checkboxes for matching rules)
+            from PySide6.QtWidgets import QCheckBox
+            chk_ws = QCheckBox(_('Ignore whitespace'), dlg)
+            chk_ci = QCheckBox(_('Case-insensitive'), dlg)
+            chk_pu = QCheckBox(_('Ignore punctuation'), dlg)
+
+            # Buttons
+            btn_export = QPushButton(_('Export report'), dlg)
+            btn_refresh = QPushButton(_('Refresh'), dlg)
+
+            details = QTextEdit(dlg)
+            details.setReadOnly(True)
+
+            btnBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg)
+            btnBox.button(QDialogButtonBox.Ok).setText(_('Delete duplicates'))
+            btnBox.button(QDialogButtonBox.Cancel).setText(_('Cancel'))
+
+            # Layout
+            opt_layout = QHBoxLayout()
+            opt_layout.addWidget(chk_ws)
+            opt_layout.addWidget(chk_ci)
+            opt_layout.addWidget(chk_pu)
+            opt_layout.addStretch()
+            opt_layout.addWidget(btn_refresh)
+            opt_layout.addWidget(btn_export)
+
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(header_label)
+            layout.addLayout(opt_layout)
+            layout.addWidget(details)
+            layout.addWidget(btnBox)
+
+            def build_text_from_groups(dup_groups):
+                total_groups = len(dup_groups)
+                total_duplicates = sum(len(v) - 1 for v in dup_groups.values())
+                header_label.setText(_(f"Found {total_groups} groups with {total_duplicates} duplicate notes.\n"))
+                lines = []
+                for idx, (key, entries) in enumerate(dup_groups.items(), 1):
+                    title = entries[0][1]
+                    loc = entries[0][3]
+                    lines.append(f"Group {idx}: Title='{title[:80]}' Location={loc} Count={len(entries)}")
+                    for note in entries:
+                        nid, t, c, l = note
+                        snippet = (c or '')[:200].replace('\n', ' ')
+                        lines.append(f"  - NoteId={nid} Snippet='{snippet}'")
+                    lines.append('')
+                return '\n'.join(lines), total_duplicates
+
+            def refresh_preview():
+                opts['ignore_whitespace'] = chk_ws.isChecked()
+                opts['case_insensitive'] = chk_ci.isChecked()
+                opts['ignore_punctuation'] = chk_pu.isChecked()
+                try:
+                    dup_groups = compute_func(opts)
+                    text, total = build_text_from_groups(dup_groups)
+                    details.setPlainText(text)
+                    return dup_groups, total
+                except Exception as e:
+                    details.setPlainText(str(e))
+                    return {}, 0
+
+            def do_export():
+                # Save current details to file
+                fname = QFileDialog.getSaveFileName(self, _('Export duplicate report'), f'{self.working_dir}/duplicates_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt', _('Text files')+' (*.txt)')[0]
+                if not fname:
+                    return
+                try:
+                    with open(fname, 'w', encoding='utf-8') as f:
+                        f.write(details.toPlainText())
+                    self.statusBar.showMessage(' '+_('Report saved'), 4000)
+                except Exception as e:
+                    QMessageBox.critical(self, _('Error'), str(e))
+
+            btn_refresh.clicked.connect(refresh_preview)
+            btn_export.clicked.connect(do_export)
+
+            # initial preview
+            dup_groups, total = refresh_preview()
+
+            accepted = dlg.exec()
+            # if accepted, dlg.result() True means user clicked Delete
+            return accepted, dup_groups, total
+
+        # Run detection and present to user
+        self.statusBar.showMessage(' '+_('Scanning for duplicate notes…'))
+        app.processEvents()
+        try:
+            con = sqlite3.connect(f'{TMP_PATH}/{DB_NAME}')
+            cur = con.cursor()
+            # compute function applies current matching options when called
+            def compute_with_opts(opts):
+                return find_duplicates(cur,
+                                       ignore_whitespace=opts.get('ignore_whitespace', False),
+                                       case_insensitive=opts.get('case_insensitive', False),
+                                       ignore_punctuation=opts.get('ignore_punctuation', False))
+
+            # initial check to see if any duplicates exist with default options
+            initial_groups = compute_with_opts({'ignore_whitespace': False, 'case_insensitive': False, 'ignore_punctuation': False})
+            if not initial_groups:
+                self.statusBar.showMessage(' '+_('No duplicate notes found'), 4000)
+                con.close()
+                return
+
+            confirmed, dup_groups, total_dup = present_duplicates_dialog(compute_with_opts)
+            if not confirmed:
+                self.statusBar.showMessage(' '+_('Cancelled'), 2000)
+                con.close()
+                return
+
+            # Delete duplicate note ids, keeping first occurrence in each group
+            ids_to_delete = []
+            for entries in dup_groups.values():
+                # entries are in order; keep first, delete rest
+                ids = [e[0] for e in entries]
+                ids_to_delete.extend(ids[1:])
+
+            if ids_to_delete:
+                # chunk deletion if too many
+                CHUNK = 500
+                for i in range(0, len(ids_to_delete), CHUNK):
+                    chunk = ids_to_delete[i:i+CHUNK]
+                    ids_str = str(chunk).replace('[', '(').replace(']', ')')
+                    cur.execute(f'DELETE FROM Note WHERE NoteId IN {ids_str};')
+            con.commit()
+            con.close()
+        except Exception as ex:
+            self.crash_box(ex)
+            self.clean_up()
+            sys.exit()
+
+        if total_dup > 0:
+            message = f' {total_dup:,} '+_('duplicate notes removed')
+            self.statusBar.showMessage(message, 4000)
+            self.regroup(True, message)
+            self.archive_modified()
 
     def trim_db(self):
         try:
